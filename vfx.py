@@ -4,7 +4,6 @@ import numpy as np
 import pywt
 import random
 from pathlib import Path
-from scipy.ndimage import gaussian_filter, maximum_filter, gaussian_filter1d, gaussian_laplace, gaussian_gradient_magnitude
 from matplotlib import pyplot as plt
 
 # Classic Harris and Multi-Scale Harris Definitions
@@ -15,7 +14,7 @@ def harris_corner(
         sigma=3,
         k_value=0.04,
         thresh_rel=0.001,
-        max_corners=10000,
+        max_corners=200000,
         min_dist=0
     ):
     I = img_gray.astype(np.float32)
@@ -65,7 +64,7 @@ def multiscale_harris(
         sigma_i=1.5,            
         k_value=0.04,
         thresh_rel=0.001,
-        max_corners=10000,
+        max_corners=5000,
         min_dist=0
     ):
     img0 = img_gray.astype(np.float32)
@@ -193,39 +192,87 @@ def compute_msop_descriptor(gray, kp, spacing=5):
     n = np.linalg.norm(desc)
     return desc/n if n>1e-7 else desc
 
+def compute_SIFT_descriptor(gray, kp, num_bins=8, window_width=4, descriptor_size=16):
+    """
+    Compute a 128-D SIFT descriptor for a single keypoint.
+    - gray: input image (grayscale float32)
+    - kp: cv2.KeyPoint with .pt, .angle, .size
+    """
+    x, y = kp.pt
+    angle = kp.angle
+    patch_size = descriptor_size
+    # Rotate and extract patch around keypoint
+    M = cv2.getRotationMatrix2D((x, y), angle, 1.0)
+    # Shift so that keypoint is at center of patch
+    M[0,2] += patch_size/2.0 - x
+    M[1,2] += patch_size/2.0 - y
+    patch = cv2.warpAffine(gray, M, (patch_size, patch_size),
+                           flags=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_REFLECT101)
+
+    # Compute gradients in patch
+    Ix = cv2.Sobel(patch, cv2.CV_32F, 1, 0, ksize=1)
+    Iy = cv2.Sobel(patch, cv2.CV_32F, 0, 1, ksize=1)
+    mag = np.sqrt(Ix**2 + Iy**2)
+    ori = (np.degrees(np.arctan2(Iy, Ix)) % 360)
+
+    # Gaussian weighting window
+    weight = cv2.getGaussianKernel(patch_size, patch_size/2)
+    weight = weight @ weight.T
+
+    # Descriptor: 4x4 cells, each with num_bins bins -> 128 dims
+    cell_size = patch_size // window_width  # e.g., 16/4 = 4
+    descriptor = []
+    for i in range(window_width):
+        for j in range(window_width):
+            # Extract cell
+            y0, y1 = i*cell_size, (i+1)*cell_size
+            x0, x1 = j*cell_size, (j+1)*cell_size
+            cell_mag = mag[y0:y1, x0:x1]
+            cell_ori = ori[y0:y1, x0:x1]
+            cell_weight = weight[y0:y1, x0:x1]
+            # Build histogram
+            hist, _ = np.histogram(
+                cell_ori,
+                bins=num_bins,
+                range=(0, 360),
+                weights=cell_mag * cell_weight
+            )
+            descriptor.extend(hist)
+
+    descriptor = np.array(descriptor, dtype=np.float32)
+    # Normalize, threshold, renormalize
+    norm = np.linalg.norm(descriptor)
+    if norm > 1e-7:
+        descriptor /= norm
+        # Threshold
+        descriptor = np.clip(descriptor, 0, 0.2)
+        # Renormalize
+        descriptor /= np.linalg.norm(descriptor)
+    return descriptor
 
 # Detection and Description
-def detect_and_describe(gray, type_of_detector='harris'):
+def detect_and_describe(gray, type_of_detector='multiscale_harris', type_of_descriptor='msop'):
+    # Detector
     if type_of_detector == 'harris':
         kps, R = harris_corner(gray)
         Rs = [(R, 0)]
     else:
         kps, R = multiscale_harris(gray)
         Rs = [(R, 0)]
-    assign_orientations(gray, kps)
-    des = np.array([compute_msop_descriptor(gray, kp) for kp in kps], dtype=np.float32)
+
+    # Descriptor
+    if type_of_descriptor == 'msop':
+        assign_orientations(gray, kps)
+        des = np.array([compute_msop_descriptor(gray, kp) for kp in kps], dtype=np.float32)
+    else:
+        # SIFT
+        assign_orientations(gray, kps)
+        des = np.array([compute_SIFT_descriptor(gray, kp) for kp in kps], dtype=np.float32)
+
     return kps, des, Rs
-def solve_homography(src_pts, dst_pts):
-    """
-    src_pts, dst_pts: shape (4, 2) 或 (N, 2)，至少 4 對點
-    回傳 3×3 homography，若無法計算則回傳 None
-    """
-    if src_pts.shape[0] < 4:
-        return None
-    A = []
-    for (x, y), (u, v) in zip(src_pts, dst_pts):
-        A.append([-x, -y, -1,  0,  0,  0,  u*x,  u*y,  u])
-        A.append([ 0,  0,  0, -x, -y, -1,  v*x,  v*y,  v])
-    A = np.asarray(A, dtype=np.float64)
 
-    # 利用 SVD 取最後一個特徵向量
-    U, S, Vt = np.linalg.svd(A)
-    H = Vt[-1].reshape(3, 3)
 
-    # 規一化，使 H[2,2] = 1
-    if abs(H[2, 2]) < 1e-8:
-        return None
-    return H / H[2, 2]
 # ---- Matching using Translation-only RANSAC and save the image of the matching ----
 #  作對照組時改use_ransac參數如果你不要用ransac
 def match_keypoints(
@@ -239,32 +286,24 @@ def match_keypoints(
         img1           = None,
         img2           = None
     ):
-    # bf   = cv2.BFMatcher(cv2.NORM_L2)
-    # raw  = bf.knnMatch(des1, des2, k=2)
-    # # good = []
-    # # for m, n in raw:
-    # #     if m.distance < ratio * n.distance:
-    # #         good.append(m)
-    # good = [m for m, n in raw if m.distance < ratio * n.distance]
-    
+
     bf = cv2.BFMatcher(cv2.NORM_L2)
-    
-    # # 1) dire1 ratio-test
-    # raw12  = bf.knnMatch(des1, des2, k=2)
-    # good12 = [m for m,n in raw12 if m.distance < ratio * n.distance]
 
-    # # 2) dire2 ratio-test
-    # raw21  = bf.knnMatch(des2, des1, k=2)
-    # good21 = [m for m,n in raw21 if m.distance < ratio * n.distance]
+    # 1) des1 -> des2 ratio-test
+    raw12  = bf.knnMatch(des1, des2, k=2)
+    good12 = [m for m, n in raw12 if m.distance < ratio * n.distance]
 
-    # # 3) mutual check
-    # idx21 = {(m.trainIdx, m.queryIdx) for m in good21}
-    # mutual = [m for m in good12 if (m.queryIdx, m.trainIdx) in idx21]
-    raw  = bf.match(des1, des2)        # 單向即可，crossCheck=True 會自動驗證雙向最佳
+    # 2) des2 -> des1 ratio-test
+    raw21  = bf.knnMatch(des2, des1, k=2)
+    good21 = [m for m, n in raw21 if m.distance < ratio * n.distance]
 
+    # 3) mutual check (確保兩邊都視對方為最佳)
+    idx21 = {(m.trainIdx, m.queryIdx) for m in good21}
+    mutual = [m for m in good12 if (m.queryIdx, m.trainIdx) in idx21]
 
-   # 取距離最小的前30
-    good = sorted(raw, key=lambda m: m.distance)[:]
+    # 4) 取距離最小的前 30 個
+    good = sorted(mutual, key=lambda m: m.distance)[:30]
+
 
     # 5) 至少要有 4 个匹配
     if len(good) < 4:
@@ -397,7 +436,7 @@ def backward_warp(src, H, dst_h, dst_w, off_x, off_y):
 ###################
 
 # stitch
-def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_end_to_end_alignment=False  , used_ransac=True):
+def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_end_to_end_alignment=True  , used_ransac=True,descriptor_type='msop'):
     focals = load_focal_lengths(pano_txt)
     imgs, grays = [], []
     harris_kps, harris_des, harris_Rs = [], [], []
@@ -427,15 +466,15 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
             )
             gray = cv2.cvtColor(cyl, cv2.COLOR_BGR2GRAY)
 
-            kh, dh, Rh = detect_and_describe(gray, 'harris')
-            km, dm, Rm = detect_and_describe(gray, 'multiscale')
+            kh, dh, Rh = detect_and_describe(gray, 'harris',descriptor_type)
+            km, dm, Rm = detect_and_describe(gray, 'multiscale',descriptor_type)
 
             imgs.append(cyl)       # 注意這裡用 cyl 而不是原圖
         # 不是別做
         else:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            kh, dh, Rh = detect_and_describe(gray, 'harris')
-            km, dm, Rm = detect_and_describe(gray, 'multiscale')
+            kh, dh, Rh = detect_and_describe(gray, 'harris',descriptor_type)
+            km, dm, Rm = detect_and_describe(gray, 'multiscale',descriptor_type)
             imgs.append(img)
 
         grays.append(gray)
@@ -466,7 +505,7 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
             multi_kps[i-1], multi_kps[i],
             use_ransac=use_ransac,
             ransac_thresh=ransac_thresh,
-            save_match_img=os.path.join(
+            save_match_img=os.path.join(        
                 folder_for_res,
                 f"match_{'ransac' if use_ransac else 'no_ransac'}_multiscale_{i-1}_{i}.jpg"
             ),
@@ -554,107 +593,79 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
     pano_w, pano_h = int(np.ceil(max_x-min_x)), int(np.ceil(max_y-min_y))
     off_x, off_y   = -min_x, -min_y
     print("Wait pationtly, stitching images...")
-        
-    def make_panorama_pyramid(Hs, levels=4):
-        acc = np.zeros((pano_h, pano_w, 3), np.float32)
-        w_acc = np.zeros((pano_h, pano_w), np.float32)
 
-        for img, H in zip(imgs, Hs):
-            warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
-            if not valid.any():
-                continue
+    # blending works well on example photo
+    if choose_example:
+        def make_panorama(Hs, levels=1):
+            acc    = np.zeros((pano_h, pano_w, 3), np.float32)
+            w_acc  = np.zeros((pano_h, pano_w),    np.float32)
 
-            mask = valid.astype(np.float32)
-            mask = cv2.GaussianBlur(mask, (31, 31), 0)
-            mask /= mask.max() + 1e-6
+            for img, H in zip(imgs, Hs):
+                warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
+                if not valid.any():
+                    continue
 
-            # Build pyramids
-            gp_img = [warped.astype(np.float32)]
-            gp_mask = [mask]
-            for _ in range(levels):
-                gp_img.append(cv2.pyrDown(gp_img[-1]))
-                gp_mask.append(cv2.pyrDown(gp_mask[-1]))
+                # build a smooth, distance‐based weight mask:
+                #  - valid is 0/1, so distanceTransform gives high values in
+                #    the interior, zero at the edges
+                mask_uint8 = valid.astype(np.uint8)
+                dist_map   = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, 5)
+                R = 45  # 作用半徑可調use 45 on example
+                mask_raw = np.minimum(dist_map, R) / float(R)
+                mask = np.clip(mask_raw, 0, 1)
 
-            # Build Laplacian pyramid
-            lp_img = []
-            for i in range(levels):
-                size = gp_img[i].shape[1], gp_img[i].shape[0]
-                up = cv2.pyrUp(gp_img[i + 1], dstsize=size)
-                lap = gp_img[i] - up
-                lp_img.append(lap)
-            lp_img.append(gp_img[-1])
+                # build Gaussian pyramids of image & mask
+                gp_img  = [warped.astype(np.float32)]
+                gp_mask = [mask]
+                for _ in range(levels):
+                    gp_img .append(cv2.pyrDown(gp_img[-1]))
+                    gp_mask.append(cv2.pyrDown(gp_mask[-1]))
 
-            # Blend each level
-            blended_pyr = []
-            for lap, m in zip(lp_img, gp_mask):
-                if lap.ndim == 3 and m.ndim == 2:
-                    m = m[..., None]
-                blended_pyr.append(lap * m)
+                # build Laplacian pyramid of the image
+                lp_img = []
+                for i in range(levels):
+                    size     = (gp_img[i].shape[1], gp_img[i].shape[0])
+                    up       = cv2.pyrUp(gp_img[i+1], dstsize=size)
+                    lap      = gp_img[i] - up
+                    lp_img.append(lap)
+                lp_img.append(gp_img[-1])  # top level
 
-            # Collapse pyramid
-            blended = blended_pyr[-1]
-            for i in range(levels - 1, -1, -1):
-                size = blended_pyr[i].shape[1], blended_pyr[i].shape[0]
-                blended = cv2.pyrUp(blended, dstsize=size) + blended_pyr[i]
+                # blend each Laplacian level by the corresponding mask level
+                blended_pyr = []
+                for L, M in zip(lp_img, gp_mask):
+                    if L.ndim == 3:
+                        M = M[..., None]
+                    blended_pyr.append(L * M)
 
-            acc += blended
-            w_acc += mask
+                # reconstruct blended image
+                blended = blended_pyr[-1]
+                for i in range(levels-1, -1, -1):
+                    size    = (blended_pyr[i].shape[1], blended_pyr[i].shape[0])
+                    blended = cv2.pyrUp(blended, dstsize=size) + blended_pyr[i]
 
-        pano = acc / np.maximum(w_acc[..., None], 1e-6)
-        pano = np.clip(pano, 0, 255).astype(np.uint8)
-        return pano
+                # accumulate
+                acc   += blended
+                w_acc += mask
 
-    # def make_panorama(Hs, blur_size: int = 31):
-    #     """
-    # 參數
-    # ----
-    # Hs : list[np.ndarray]
-    #     每張影像到全景座標系的 3×3 homography
-    # blur_size : int, optional
-    #     產生 feather 權重時的高斯核大小 (奇數，越大過渡越平滑)
-    # 全域依賴
-    # ----------
-    # imgs      : list[np.ndarray]
-    # pano_h/w  : int
-    # off_x/y   : float 或 int
-    # backward_warp(img, H, h, w, ox, oy) -> (warped_img, valid_mask)
-    # """
-    #     # 1. 累加用大畫布 (float32 以免溢位)
-    #     acc   = np.zeros((pano_h, pano_w, 3), np.float32)   # 色彩累加
-    #     w_acc = np.zeros((pano_h, pano_w),     np.float32)   # 權重累加
+            # normalize by total weight and clamp
+            pano = acc / np.maximum(w_acc[..., None], 1e-6)
+            pano = np.clip(pano, 0, 255).astype(np.uint8)
+            return pano
 
-    #     for img, H in zip(imgs, Hs):
-    #         warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
-    #         if not valid.any():
-    #             continue
-
-    #         # 2. 建立 feather 權重 (0‒1)，邊緣漸淡
-    #         mask = valid.astype(np.float32)
-    #         mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-    #         mask /= mask.max() + 1e-6          # 正規化
-
-    #         # 3. 累加 (像素 × 權重) 與 權重本身
-    #         acc   += warped * mask[..., None]
-    #         w_acc += mask
-
-    #     # 4. 取平均並轉回 uint8
-    #     pano = acc / np.maximum(w_acc[..., None], 1e-6)
-    #     pano = np.clip(pano, 0, 255).astype(np.uint8)
-    #     return pano
+        return make_panorama(Hs_harris), make_panorama(Hs_multi)
     
-    def make_panorama(Hs):
-        pano = np.zeros((pano_h, pano_w, 3), dtype=np.uint8)
-        for img, H in zip(imgs, Hs):
-            warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
-            if not valid.any():
-                continue
-            pano[valid] = warped[valid]
-        return pano
-
-
-
-    return make_panorama(Hs_harris), make_panorama(Hs_multi)
-    # return make_panorama_pyramid(Hs_harris), make_panorama_pyramid(Hs_multi)
+    # 自己的照片就不做blending了 跟屎一樣
+    else:
+        def make_panorama(Hs):
+                pano = np.zeros((pano_h, pano_w, 3), dtype=np.uint8)
+                for img, H in zip(imgs, Hs):
+                    warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
+                    if not valid.any():
+                        continue
+                    pano[valid] = warped[valid]
+                return pano
+        return make_panorama(Hs_harris), make_panorama(Hs_multi)    
+        
 
 # 切圖片
 def crop_by_ratio(img, axis='vertical', keep='first', ratio=0.9):
@@ -688,16 +699,19 @@ def crop_by_ratio(img, axis='vertical', keep='first', ratio=0.9):
 
 if __name__=='__main__':
 
+    # - 可以自行選擇是否開啟 End-to-End 對齊 (do_end_to_end_alignment)
+    # - 是否啟用 RANSAC 過濾錯誤匹配點 (used_ransac)
+    # - 可指定特徵點描述子類型（如 SIFT、MSOP）
+
     # example
     folder = 'parrington 2'
     output_folder = 'parrington2_res'
     pano_txt = os.path.join(folder, 'pano.txt')
     os.makedirs(output_folder, exist_ok=True)
-    pano , pano2 = stitch_images(True,folder, output_folder, pano_txt , do_end_to_end_alignment=True , used_ransac=True , n=18)
+    pano , pano2 = stitch_images(True,folder, output_folder, pano_txt , do_end_to_end_alignment=True , used_ransac=True , n=18 , descriptor_type='msop')
     cv2.imwrite(os.path.join(output_folder, 'panorama.jpg'), pano)
     cv2.imwrite(os.path.join(output_folder, 'panorama_multiscale.jpg'), pano2)
     print('Done')
-
 
     # our photo
     folder = 'target'
@@ -705,7 +719,7 @@ if __name__=='__main__':
     pano_txt = os.path.join(folder, 'focal.txt')
     os.makedirs(output_folder, exist_ok=True)
     # 對照組可以把do_end_to_end_alignment 還有 used_ransac 設成False/true
-    pano_our , pano2_our = stitch_images(False,folder, output_folder, pano_txt , do_end_to_end_alignment=True , used_ransac=False , n=8)
+    pano_our , pano2_our = stitch_images(False,folder, output_folder, pano_txt , do_end_to_end_alignment=True , used_ransac=True , n=8, descriptor_type='msop')
     cv2.imwrite(os.path.join(output_folder, 'panorama.jpeg'), pano_our)
     cv2.imwrite(os.path.join(output_folder, 'panorama_multiscale.jpeg'), pano2_our)
     print("Done")
