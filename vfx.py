@@ -554,6 +554,55 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
     pano_w, pano_h = int(np.ceil(max_x-min_x)), int(np.ceil(max_y-min_y))
     off_x, off_y   = -min_x, -min_y
     print("Wait pationtly, stitching images...")
+        
+    def make_panorama_pyramid(Hs, levels=4):
+        acc = np.zeros((pano_h, pano_w, 3), np.float32)
+        w_acc = np.zeros((pano_h, pano_w), np.float32)
+
+        for img, H in zip(imgs, Hs):
+            warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
+            if not valid.any():
+                continue
+
+            mask = valid.astype(np.float32)
+            mask = cv2.GaussianBlur(mask, (31, 31), 0)
+            mask /= mask.max() + 1e-6
+
+            # Build pyramids
+            gp_img = [warped.astype(np.float32)]
+            gp_mask = [mask]
+            for _ in range(levels):
+                gp_img.append(cv2.pyrDown(gp_img[-1]))
+                gp_mask.append(cv2.pyrDown(gp_mask[-1]))
+
+            # Build Laplacian pyramid
+            lp_img = []
+            for i in range(levels):
+                size = gp_img[i].shape[1], gp_img[i].shape[0]
+                up = cv2.pyrUp(gp_img[i + 1], dstsize=size)
+                lap = gp_img[i] - up
+                lp_img.append(lap)
+            lp_img.append(gp_img[-1])
+
+            # Blend each level
+            blended_pyr = []
+            for lap, m in zip(lp_img, gp_mask):
+                if lap.ndim == 3 and m.ndim == 2:
+                    m = m[..., None]
+                blended_pyr.append(lap * m)
+
+            # Collapse pyramid
+            blended = blended_pyr[-1]
+            for i in range(levels - 1, -1, -1):
+                size = blended_pyr[i].shape[1], blended_pyr[i].shape[0]
+                blended = cv2.pyrUp(blended, dstsize=size) + blended_pyr[i]
+
+            acc += blended
+            w_acc += mask
+
+        pano = acc / np.maximum(w_acc[..., None], 1e-6)
+        pano = np.clip(pano, 0, 255).astype(np.uint8)
+        return pano
 
     # def make_panorama(Hs, blur_size: int = 31):
     #     """
@@ -605,6 +654,7 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
 
 
     return make_panorama(Hs_harris), make_panorama(Hs_multi)
+    # return make_panorama_pyramid(Hs_harris), make_panorama_pyramid(Hs_multi)
 
 # 切圖片
 def crop_by_ratio(img, axis='vertical', keep='first', ratio=0.9):
