@@ -14,9 +14,9 @@ def harris_corner(
         window_size=9,
         sigma=3,
         k_value=0.04,
-        thresh_rel=0.1,
+        thresh_rel=0.001,
         max_corners=10000,
-        min_dist=1
+        min_dist=0
     ):
     I = img_gray.astype(np.float32)
     Ix = cv2.Sobel(I, cv2.CV_32F, 1, 0, ksize=3)
@@ -65,7 +65,7 @@ def multiscale_harris(
         sigma_i=1.5,            
         k_value=0.04,
         thresh_rel=0.001,
-        max_corners=1000,
+        max_corners=10000,
         min_dist=0
     ):
     img0 = img_gray.astype(np.float32)
@@ -205,27 +205,73 @@ def detect_and_describe(gray, type_of_detector='harris'):
     assign_orientations(gray, kps)
     des = np.array([compute_msop_descriptor(gray, kp) for kp in kps], dtype=np.float32)
     return kps, des, Rs
+def solve_homography(src_pts, dst_pts):
+    """
+    src_pts, dst_pts: shape (4, 2) 或 (N, 2)，至少 4 對點
+    回傳 3×3 homography，若無法計算則回傳 None
+    """
+    if src_pts.shape[0] < 4:
+        return None
+    A = []
+    for (x, y), (u, v) in zip(src_pts, dst_pts):
+        A.append([-x, -y, -1,  0,  0,  0,  u*x,  u*y,  u])
+        A.append([ 0,  0,  0, -x, -y, -1,  v*x,  v*y,  v])
+    A = np.asarray(A, dtype=np.float64)
 
+    # 利用 SVD 取最後一個特徵向量
+    U, S, Vt = np.linalg.svd(A)
+    H = Vt[-1].reshape(3, 3)
+
+    # 規一化，使 H[2,2] = 1
+    if abs(H[2, 2]) < 1e-8:
+        return None
+    return H / H[2, 2]
 # ---- Matching using Translation-only RANSAC and save the image of the matching ----
 #  作對照組時改use_ransac參數如果你不要用ransac
 def match_keypoints(
         des1, des2, kps1, kps2,
-        ratio          = 0.9,
+        ratio          = 1.5,
         use_ransac     = False,
         ransac_thresh  = 5.0,
-        max_iters      = 100000,
-        confidence     = 0.99,
+        max_iters      = 10000,
+        confidence     = 0.9,
         save_match_img = None,
         img1           = None,
         img2           = None
     ):
-    bf   = cv2.BFMatcher(cv2.NORM_L2)
-    raw  = bf.knnMatch(des1, des2, k=2)
-    good = [m for m, n in raw if m.distance < ratio * n.distance]
+    # bf   = cv2.BFMatcher(cv2.NORM_L2)
+    # raw  = bf.knnMatch(des1, des2, k=2)
+    # # good = []
+    # # for m, n in raw:
+    # #     if m.distance < ratio * n.distance:
+    # #         good.append(m)
+    # good = [m for m, n in raw if m.distance < ratio * n.distance]
+    
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+    
+    # # 1) dire1 ratio-test
+    # raw12  = bf.knnMatch(des1, des2, k=2)
+    # good12 = [m for m,n in raw12 if m.distance < ratio * n.distance]
+
+    # # 2) dire2 ratio-test
+    # raw21  = bf.knnMatch(des2, des1, k=2)
+    # good21 = [m for m,n in raw21 if m.distance < ratio * n.distance]
+
+    # # 3) mutual check
+    # idx21 = {(m.trainIdx, m.queryIdx) for m in good21}
+    # mutual = [m for m in good12 if (m.queryIdx, m.trainIdx) in idx21]
+    raw  = bf.match(des1, des2)        # 單向即可，crossCheck=True 會自動驗證雙向最佳
+
+
+   # 取距離最小的前30
+    good = sorted(raw, key=lambda m: m.distance)[:]
+
+    # 5) 至少要有 4 个匹配
     if len(good) < 4:
         return None
-    pts1 = np.float32([kps1[m.queryIdx].pt for m in good])
-    pts2 = np.float32([kps2[m.trainIdx].pt for m in good])
+    pts1 = np.float32([ kps1[m.queryIdx].pt for m in good ])
+    pts2 = np.float32([ kps2[m.trainIdx].pt for m in good ])
+
     if use_ransac:
         best_inlier_idx, best_score = [], 0
         n_samples = 1
@@ -362,12 +408,15 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
     # --------- 1. 讀檔 & 描述子 ---------
     for i in range(n):
         if choose_example:
+            
             path = os.path.join(folder, f"prtn{i:02d}.jpg")
             img  = cv2.imread(path)
+            img = crop_by_ratio(img, axis='vertical', keep='second')
         # using our photo
         else:
             path = os.path.join(folder, f"IMG_{5558+i}.jpeg")
             img  = cv2.imread(path)
+            img = crop_by_ratio(img, axis='vertical', keep='second')
         if img is None:
             print(f"Cannot read {path}")
             continue
@@ -505,16 +554,83 @@ def stitch_images(choose_example , folder, folder_for_res, pano_txt, n=18, do_en
     pano_w, pano_h = int(np.ceil(max_x-min_x)), int(np.ceil(max_y-min_y))
     off_x, off_y   = -min_x, -min_y
     print("Wait pationtly, stitching images...")
-    # --------- 4. 產生 Panorama (手動 back-warp) ---------
+
+    # def make_panorama(Hs, blur_size: int = 31):
+    #     """
+    # 參數
+    # ----
+    # Hs : list[np.ndarray]
+    #     每張影像到全景座標系的 3×3 homography
+    # blur_size : int, optional
+    #     產生 feather 權重時的高斯核大小 (奇數，越大過渡越平滑)
+    # 全域依賴
+    # ----------
+    # imgs      : list[np.ndarray]
+    # pano_h/w  : int
+    # off_x/y   : float 或 int
+    # backward_warp(img, H, h, w, ox, oy) -> (warped_img, valid_mask)
+    # """
+    #     # 1. 累加用大畫布 (float32 以免溢位)
+    #     acc   = np.zeros((pano_h, pano_w, 3), np.float32)   # 色彩累加
+    #     w_acc = np.zeros((pano_h, pano_w),     np.float32)   # 權重累加
+
+    #     for img, H in zip(imgs, Hs):
+    #         warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
+    #         if not valid.any():
+    #             continue
+
+    #         # 2. 建立 feather 權重 (0‒1)，邊緣漸淡
+    #         mask = valid.astype(np.float32)
+    #         mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    #         mask /= mask.max() + 1e-6          # 正規化
+
+    #         # 3. 累加 (像素 × 權重) 與 權重本身
+    #         acc   += warped * mask[..., None]
+    #         w_acc += mask
+
+    #     # 4. 取平均並轉回 uint8
+    #     pano = acc / np.maximum(w_acc[..., None], 1e-6)
+    #     pano = np.clip(pano, 0, 255).astype(np.uint8)
+    #     return pano
+    
     def make_panorama(Hs):
         pano = np.zeros((pano_h, pano_w, 3), dtype=np.uint8)
         for img, H in zip(imgs, Hs):
             warped, valid = backward_warp(img, H, pano_h, pano_w, off_x, off_y)
+            if not valid.any():
+                continue
             pano[valid] = warped[valid]
         return pano
 
+
+
     return make_panorama(Hs_harris), make_panorama(Hs_multi)
 
+# 切圖片
+def crop_by_ratio(img, axis='vertical', keep='first', ratio=0.9):
+    
+    if not (0 < ratio < 1):
+        raise ValueError("ratio must be between 0 and 1")
+
+    h, w = img.shape[:2]
+    if axis == 'vertical':
+        cut = int(w * ratio)
+        if keep == 'first':
+            return img[:, :cut]
+        elif keep == 'second':
+            return img[:, w-cut:]
+        else:
+            raise ValueError("keep must be 'first' or 'second'")
+    elif axis == 'horizontal':
+        cut = int(h * ratio)
+        if keep == 'first':
+            return img[:cut, :]
+        elif keep == 'second':
+            return img[h-cut:, :]
+        else:
+            raise ValueError("keep must be 'first' or 'second'")
+    else:
+        raise ValueError("axis must be 'vertical' or 'horizontal'")
 
 
 
@@ -539,9 +655,8 @@ if __name__=='__main__':
     pano_txt = os.path.join(folder, 'focal.txt')
     os.makedirs(output_folder, exist_ok=True)
     # 對照組可以把do_end_to_end_alignment 還有 used_ransac 設成False/true
-    pano_our , pano2_our = stitch_images(False,folder, output_folder, pano_txt , do_end_to_end_alignment=True , used_ransac=True , n=8)
+    pano_our , pano2_our = stitch_images(False,folder, output_folder, pano_txt , do_end_to_end_alignment=True , used_ransac=False , n=8)
     cv2.imwrite(os.path.join(output_folder, 'panorama.jpeg'), pano_our)
     cv2.imwrite(os.path.join(output_folder, 'panorama_multiscale.jpeg'), pano2_our)
     print("Done")
-    
     
