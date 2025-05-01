@@ -165,6 +165,7 @@ if __name__=='__main__':
         print(f"Warning: {len(files)} images but {len(focals)} focal lengths; processing first {num} items.")
 
     for idx in range(num):
+
         current_prefix = f"img{idx}_"
         name = files[idx]
         img_path = os.path.join(image_dir, name)
@@ -196,3 +197,4 @@ if __name__=='__main__':
 
         # Visualize patches
         visualize_keypoint_patches(gray, kps)
+    print("done , all file save in res2")

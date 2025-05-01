@@ -7,3 +7,4 @@ This project focuses on building a panorama from multiple input images by detect
 git clone https://github.com/clarence1121/VFX-Project2-image-stitching.git
 cd your-repo-name
 python3 vfx.py
+python3 Harris_Corner_Detector.py
