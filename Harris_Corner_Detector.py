@@ -154,22 +154,45 @@ def load_focal_lengths(fp):
 
 
 if __name__=='__main__':
-    image_dir='parrington 2'
-    focal_file=os.path.join(image_dir,'pano.txt')
-    focals=load_focal_lengths(focal_file)
-    files=sorted([f for f in os.listdir(image_dir) if f.endswith('.jpg')])
-    for idx,name in enumerate(files):
-        current_prefix=f"img{idx}_"
-        img=cv2.imread(os.path.join(image_dir,name))
-        f=focals[idx]
-        cyl=cylindrical_projection(img,f)
-        gray=cv2.cvtColor(cyl,cv2.COLOR_BGR2GRAY).astype(np.float32)
-        kps,R=harris_features(gray)
-        # save response map
-        plt.imshow(R,cmap='jet'); plt.axis('off'); save_figure('response_map.png')
-        plot_keypoints(cyl,kps)
-        ors=sift_assign_orientation(gray,kps)
-        show_keypoints_with_orientations(cyl,ors)
-        descs=sift_describe_patch(gray,ors)
-        if descs.size: show_descriptor_vector(descs,0)
-        visualize_keypoint_patches(gray,kps)
+    image_dir = 'parrington 2'
+    focal_file = os.path.join(image_dir, 'pano.txt')
+    focals = load_focal_lengths(focal_file)
+    files = sorted([f for f in os.listdir(image_dir) if f.endswith('.jpg')])
+
+    # Ensure matching counts
+    num = min(len(files), len(focals))
+    if len(files) != len(focals):
+        print(f"Warning: {len(files)} images but {len(focals)} focal lengths; processing first {num} items.")
+
+    for idx in range(num):
+        current_prefix = f"img{idx}_"
+        name = files[idx]
+        img_path = os.path.join(image_dir, name)
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Failed to load image: {img_path}")
+            continue
+        f = focals[idx]
+
+        # Cylindrical projection and grayscale
+        cyl = cylindrical_projection(img, f)
+        gray = cv2.cvtColor(cyl, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        # Harris features and response map
+        kps, R = harris_features(gray)
+        plt.imshow(R, cmap='jet'); plt.axis('off'); save_figure('response_map.png')
+
+        # Plot keypoints
+        plot_keypoints(cyl, kps)
+
+        # Orientation assignment and plot
+        ors = sift_assign_orientation(gray, kps)
+        show_keypoints_with_orientations(cyl, ors)
+
+        # Descriptor and plot
+        descs = sift_describe_patch(gray, ors)
+        if descs.size:
+            show_descriptor_vector(descs, 0)
+
+        # Visualize patches
+        visualize_keypoint_patches(gray, kps)
