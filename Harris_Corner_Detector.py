@@ -28,8 +28,6 @@ def cylindrical_projection(img, f):
 
 def adaptive_nms(corners, response_map, desired_kp=500, initial_radius=20, min_radius=1):
     # corners = [tuple(map(int, pt)) for pt in corners]
-    print(type(response_map))
-    print(response_map)
     corners = sorted(corners, key=lambda pt: response_map[pt[0], pt[1]], reverse=True)
 
     for r in range(initial_radius, min_radius - 1, -1):
@@ -55,6 +53,22 @@ def harris_features(gray, k=0.04, window_size=3, threshold=0.01, adaptive_nums=3
     Ix = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     Iy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
 
+    """
+    # Visualize gradients
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.title("Gradient I_x")
+    plt.imshow(Ix, cmap='gray')
+    plt.colorbar()
+
+    plt.subplot(1, 2, 2)
+    plt.title("Gradient I_y")
+    plt.imshow(Iy, cmap='gray')
+    plt.colorbar()
+
+    plt.tight_layout()
+    plt.show()
+    """
     # Compute products of gradients
     Ixx = gaussian_filter(Ix**2, sigma=1)
     Iyy = gaussian_filter(Iy**2, sigma=1)
@@ -208,6 +222,48 @@ def plot_keypoints(img, points):
     plt.axis('off')
     plt.show()
 
+def visualize_keypoint_patches(img, keypoints, num_points=2, step=2):
+    """
+    Visualize gradient arrows in 16×16 patches around selected keypoints.
+
+    Args:
+        img: Grayscale image (NumPy array).
+        keypoints: List of (y, x) coordinates of keypoints.
+        num_points: How many keypoints to visualize.
+    """
+    I_x = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    I_y = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+
+    plt.figure(figsize=(4 * num_points, 5))
+    selected = keypoints[:num_points]
+
+    for i, (y, x) in enumerate(selected):
+        if y < 8 or x < 8 or y + 8 >= img.shape[0] or x + 8 >= img.shape[1]:
+            continue
+
+        patch = img[y-8:y+8, x-8:x+8]
+        patch_Ix = I_x[y-8:y+8, x-8:x+8]
+        patch_Iy = I_y[y-8:y+8, x-8:x+8]
+
+        # Subsample for clarity
+        patch_Ix_sub = patch_Ix[::step, ::step]
+        patch_Iy_sub = patch_Iy[::step, ::step]
+        patch_sub = patch[::step, ::step]
+
+        h, w = patch_Ix_sub.shape[:2]
+        X, Y = np.meshgrid(np.arange(w), np.arange(h))
+
+        plt.subplot(1, num_points, i+1)
+        plt.imshow(patch, cmap='gray')
+        plt.quiver(X, Y, patch_Ix_sub, -patch_Iy_sub, color='red', scale=50)
+        plt.title(f"Keypoint {i}")
+        plt.axis('off')
+        plt.gca().invert_yaxis()
+
+    plt.suptitle("Gradient Arrows in 16×16 Patches")
+    plt.tight_layout()
+    plt.show()
+    
 if __name__=='__main__':
     image_dir = "test1"
     focal_file = "test1/pano.txt"
@@ -216,7 +272,7 @@ if __name__=='__main__':
     image_files = sorted(list(filter(lambda x: '.jpg' in x, os.listdir(image_dir))))
 
     for idx, image_name in enumerate(image_files):
-        if idx == 10:
+        if idx == 1:
             img = cv2.imread(os.path.join(image_dir, image_name))
             f = focals[idx]
             print(os.path.join(image_dir, image_name), f)
@@ -224,18 +280,14 @@ if __name__=='__main__':
             gray_image = cv2.cvtColor(cyl_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
             keypoints, R_map = harris_features(gray_image)
             """
-            out = draw_harris_points(cyl_img.copy(), keypoints)
+            plot_keypoints(img, keypoints)
+            # out = draw_harris_points(cyl_img.copy(), keypoints)
             cv2.imshow("Harris Features", out)
             cv2.waitKey(0)
-            """
-            """
-            show_keypoints_with_orientations(img, orientation)
-            orientations = assign_orientation(img, keypoints)
-            descriptor = describe_patch(img, orientations)
+
+            orientations = sift_assign_orientation(gray_image, keypoints)
+            descriptor = sift_describe_patch(gray_image, orientations)
+            show_keypoints_with_orientations(img, orientations)
             show_descriptor_vector(descriptor)
             """
-            # selected_keypoints = adaptive_nms(keypoints, R_map, desired_kp=300)
-            plot_keypoints(img, keypoints)
-
-
-
+            visualize_keypoint_patches(gray_image, keypoints, num_points=2)
